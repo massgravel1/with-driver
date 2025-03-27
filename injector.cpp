@@ -35,93 +35,15 @@
 #include <filesystem>
 #include <fstream>
 
-// Include driver binary data
+// Include driver binary data and common definitions
 #include "driver/driver_binary.h"
+#include "driver/driver_common.h"
+#include "driver/driver.h"
 
 // Disable macro redefinition warnings
 #pragma warning(disable : 4005)
 #include <ntstatus.h>
 #pragma warning(default : 4005)
-
-// Kernel driver defines and structures
-#define offset_io_mirrore   0x2338
-#define file_device_mirrore 0x3009
-
-// IOCTL codes
-#define METHOD_BUFFERED                 0
-#define FILE_READ_ACCESS                0x0001
-#define FILE_WRITE_ACCESS               0x0002
-#define CTL_CODE(DeviceType, Function, Method, Access) \
-    (((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
-
-#define ioctl_get_module_information (ULONG)CTL_CODE(file_device_mirrore, offset_io_mirrore + 0x0010, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
-#define ioctl_copy_memory (ULONG)CTL_CODE(file_device_mirrore, offset_io_mirrore + 0x0050, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
-#define ioctl_protect_memory (ULONG)CTL_CODE(file_device_mirrore, offset_io_mirrore + 0x0100, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
-#define ioctl_alloc_memory (ULONG)CTL_CODE(file_device_mirrore, offset_io_mirrore + 0x0150, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
-#define ioctl_free_memory (ULONG)CTL_CODE(file_device_mirrore, offset_io_mirrore + 0x0200, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
-
-// Driver structures
-typedef struct _set_module_information
-{
-    ULONG pid;
-    wchar_t sz_name[32];
-} set_module_information, *pset_module_information;
-
-typedef struct _get_module_information
-{
-    ULONGLONG base_image;
-    ULONGLONG size_of_image;
-} get_module_information, *pget_module_information;
-
-typedef struct _copy_memory
-{
-    ULONGLONG buffer;
-    ULONGLONG address;
-    ULONGLONG size;
-    ULONG pid;
-    BOOLEAN write;
-} copy_memory, *pcopy_memory;
-
-typedef struct _protect_memory
-{
-    ULONG pid;
-    ULONGLONG address;
-    ULONGLONG size;
-    PDWORD new_protect;
-} protect_memory, *pprotect_memory;
-
-typedef struct _alloc_memory
-{
-    ULONG pid;
-    ULONGLONG out_address;
-    ULONGLONG size;
-    ULONG protect;
-} alloc_memory, *palloc_memory;
-
-typedef struct _free_memory
-{
-    ULONG pid;
-    ULONGLONG address;
-} free_memory, *pfree_memory;
-
-// Forward declaration of driver class
-class c_driver;
-c_driver& driver();
-
-#ifdef _WIN64
-#define CURRENT_ARCH IMAGE_FILE_MACHINE_AMD64
-#else
-#define CURRENT_ARCH IMAGE_FILE_MACHINE_I386
-#endif // _WIN64
-
-#define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
-#define RELOC_FLAG64(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
-
-#ifdef _WIN64
-#define RELOC_FLAG RELOC_FLAG64
-#else
-#define RELOC_FLAG RELOC_FLAG32
-#endif // _WIN64
 
 // Enhanced logging macros with colors
 #define LOG_COLOR_RED     "\033[31m"
@@ -143,178 +65,20 @@ c_driver& driver();
 // Driver implementation
 #define DVR_DEVICE_FILE L"\\\\.\\EIQDV" 
 
-class c_driver
-{
-public:
-    c_driver() {}
-    ~c_driver() { if (h_driver != INVALID_HANDLE_VALUE) CloseHandle(h_driver); }
+#ifdef _WIN64
+#define CURRENT_ARCH IMAGE_FILE_MACHINE_AMD64
+#else
+#define CURRENT_ARCH IMAGE_FILE_MACHINE_I386
+#endif // _WIN64
 
-    DWORD process_id = 0;
+#define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
+#define RELOC_FLAG64(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
 
-    static c_driver& singleton()
-    {
-        static c_driver p_object;
-        return p_object;
-    }
-
-    void handle_driver()
-    {
-        h_driver = CreateFileW(DVR_DEVICE_FILE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    }
-
-    void attach_process(DWORD pid)
-    {
-        log_info("Attaching to process ID: %d", pid);
-        process_id = pid;
-    }
-
-    NTSTATUS send_service(ULONG ioctl_code, LPVOID io, DWORD size)
-    {
-        if (h_driver == INVALID_HANDLE_VALUE) {
-            log_error("Driver handle is invalid");
-            return STATUS_DEVICE_DOES_NOT_EXIST;
-        }
-
-        log_debug("Sending IOCTL: 0x%X, Size: %d", ioctl_code, size);
-        
-        if (!DeviceIoControl(h_driver, ioctl_code, io, size, nullptr, 0, NULL, NULL)) {
-            DWORD error = GetLastError();
-            log_error("DeviceIoControl failed with error: 0x%X", error);
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        log_debug("IOCTL operation completed successfully");
-        return STATUS_SUCCESS;
-    }
-
-    NTSTATUS get_module_information_ex(const wchar_t* name, pget_module_information mod)
-    {
-        if (h_driver == INVALID_HANDLE_VALUE) {
-            log_error("Driver handle is invalid");
-            return STATUS_DEVICE_DOES_NOT_EXIST;
-        }
-        
-        log_debug("Getting module information for: %ws", name);
-        
-        set_module_information req = { 0 };
-        req.pid = process_id;
-        wcscpy_s(req.sz_name, name);
-
-        if (!DeviceIoControl(h_driver, ioctl_get_module_information, &req, sizeof(req), mod, sizeof(get_module_information), 0, NULL)) {
-            DWORD error = GetLastError();
-            log_error("Failed to get module information. Error: 0x%X", error);
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        log_debug("Module base: 0x%llX, Size: 0x%llX", (unsigned long long)mod->base_image, (unsigned long long)mod->size_of_image);
-        return STATUS_SUCCESS;
-    }
-
-    NTSTATUS read_memory_ex(PVOID base, PVOID buffer, DWORD size)
-    {
-        log_debug("Reading memory at 0x%p, Size: %d", base, size);
-        
-        copy_memory req = { 0 };
-        req.pid = process_id;
-        req.address = reinterpret_cast<ULONGLONG>(base);
-        req.buffer = reinterpret_cast<ULONGLONG>(buffer);
-        req.size = (uint64_t)size;
-        req.write = FALSE;
-
-        NTSTATUS status = send_service(ioctl_copy_memory, &req, sizeof(req));
-        if (status != STATUS_SUCCESS) {
-            log_error("Memory read failed with status: 0x%X", status);
-        } else {
-            log_debug("Memory read successful");
-        }
-        
-        return status;
-    }
-
-    NTSTATUS write_memory_ex(PVOID base, PVOID buffer, DWORD size)
-    {
-        log_debug("Writing memory at 0x%p, Size: %d", base, size);
-        
-        copy_memory req = { 0 };
-        req.pid = process_id;
-        req.address = reinterpret_cast<ULONGLONG>(base);
-        req.buffer = reinterpret_cast<ULONGLONG>(buffer);
-        req.size = (uint64_t)size;
-        req.write = TRUE;
-
-        NTSTATUS status = send_service(ioctl_copy_memory, &req, sizeof(req));
-        if (status != STATUS_SUCCESS) {
-            log_error("Memory write failed with status: 0x%X", status);
-        } else {
-            log_debug("Memory write successful");
-        }
-        
-        return status;
-    }
-
-    NTSTATUS protect_memory_ex(uint64_t base, uint64_t size, PDWORD protection)
-    {
-        protect_memory req = { 0 };
-
-        req.pid = process_id;
-        req.address = base;
-        req.size = size;
-        req.new_protect = protection;
-
-        return send_service(ioctl_protect_memory, &req, sizeof(req));
-    }
-
-    PVOID alloc_memory_ex(DWORD size, DWORD protect)
-    {
-        log_debug("Allocating memory, Size: %d, Protection: 0x%X", size, protect);
-        
-        PVOID p_out_address = NULL;
-        alloc_memory req = { 0 };
-        req.pid = process_id;
-        req.out_address = reinterpret_cast<ULONGLONG>(&p_out_address);
-        req.size = size;
-        req.protect = protect;
-
-        NTSTATUS status = send_service(ioctl_alloc_memory, &req, sizeof(req));
-        if (status != STATUS_SUCCESS) {
-            log_error("Memory allocation failed with status: 0x%X", status);
-            return NULL;
-        }
-        
-        log_debug("Memory allocated at: 0x%p", p_out_address);
-        return p_out_address;
-    }
-
-    NTSTATUS free_memory_ex(PVOID address)
-    {
-        log_debug("Freeing memory at: 0x%p", address);
-        
-        free_memory req = { 0 };
-        req.pid = process_id;
-        req.address = reinterpret_cast<ULONGLONG>(address);
-
-        NTSTATUS status = send_service(ioctl_free_memory, &req, sizeof(req));
-        if (status != STATUS_SUCCESS) {
-            log_error("Memory free failed with status: 0x%X", status);
-        } else {
-            log_debug("Memory freed successfully");
-        }
-        
-        return status;
-    }
-    
-    inline bool is_loaded() const { return h_driver != INVALID_HANDLE_VALUE; }
-
-private:    
-    c_driver(const c_driver&) = delete;
-    c_driver& operator = (const c_driver&) = delete;
-    HANDLE h_driver = INVALID_HANDLE_VALUE;
-};
-
-inline c_driver& driver()
-{
-    return c_driver::singleton();
-}
+#ifdef _WIN64
+#define RELOC_FLAG RELOC_FLAG64
+#else
+#define RELOC_FLAG RELOC_FLAG32
+#endif // _WIN64
 
 // Function to extract driver binary to a file
 bool extract_driver(const std::wstring& driver_path) {

@@ -1,5 +1,6 @@
 #include "driver.h"
 #include "../api/xor.h"
+#include "driver_common.h"
 
 #define DVR_DEVICE_FILE xor_w(L"\\\\.\\EIQDV") 
 
@@ -38,7 +39,7 @@ NTSTATUS c_driver::get_module_information_ex(const wchar_t* name, pget_module_in
 	set_module_information req = { 0 };
 
 	req.pid = process_id;
-	wcscpy_s(req.sz_name, name);
+	wcscpy_s(req.sz_name, sizeof(req.sz_name)/sizeof(req.sz_name[0]), name);
 
 	if (!DeviceIoControl(h_driver, ioctl_get_module_information, &req, sizeof(req), mod, sizeof(get_module_information), 0, NULL))
 		return STATUS_UNSUCCESSFUL;

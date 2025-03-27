@@ -4,7 +4,7 @@
 #pragma warning(disable : 4005)
 #include <ntstatus.h>
 #pragma warning(default : 4005)
-#include "defines.h"
+#include "driver_common.h"
 
 class c_driver
 {
@@ -14,9 +14,9 @@ public:
 
 	DWORD process_id = 0;
 
-	static   c_driver& singleton();
-	void     handle_driver();
-	void     attach_process(DWORD pid);
+	static c_driver& singleton();
+	void handle_driver();
+	void attach_process(DWORD pid);
 
 	NTSTATUS send_service(ULONG ioctl_code, LPVOID io, DWORD size);
 	NTSTATUS get_module_information_ex(const wchar_t* name, pget_module_information mod);
@@ -26,11 +26,11 @@ public:
 	PVOID    alloc_memory_ex(DWORD size, DWORD protect);
 	NTSTATUS free_memory_ex(PVOID address);
 	
-	inline bool is_loaded()  const { return h_driver != INVALID_HANDLE_VALUE; }
+	inline bool is_loaded() const { return h_driver != INVALID_HANDLE_VALUE; }
 private:	
 	c_driver(const c_driver&) = delete;
 	c_driver& operator = (const c_driver&) = delete;
-	HANDLE   h_driver = INVALID_HANDLE_VALUE;
+	HANDLE h_driver = INVALID_HANDLE_VALUE;
 };
 
 inline c_driver& driver()
