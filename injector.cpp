@@ -1348,10 +1348,10 @@ bool manual_map_dll(const std::wstring& dll_path, DWORD pid) {
         return false;
     }
 
-    // Allocate memory for DLL
+    // Allocate memory for DLL with initial protection
     PVOID dll_base = driver().alloc_memory_ex(
         headers.nt_headers->OptionalHeader.SizeOfImage,
-        PAGE_EXECUTE_READWRITE
+        PAGE_READWRITE  // Start with read/write access
     );
     if (!dll_base) {
         log_error("Failed to allocate memory for DLL");
@@ -1360,20 +1360,65 @@ bool manual_map_dll(const std::wstring& dll_path, DWORD pid) {
 
     log_debug("Allocated memory at: 0x%p", dll_base);
 
-    // Map sections
+    // First write the PE header
+    if (!driver().write_memory_ex(dll_base, dll_data.data(), 0x1000)) {
+        log_error("Failed to write PE header");
+        driver().free_memory_ex(dll_base);
+        return false;
+    }
+    log_debug("Wrote PE header successfully");
+
+    // Map sections with proper permissions
     for (DWORD i = 0; i < headers.section_count; i++) {
         PIMAGE_SECTION_HEADER section = &headers.section_header[i];
-        if (section->Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
+        if (section->Characteristics & IMAGE_SCN_MEM_DISCARDABLE) {
+            log_debug("Skipping discardable section: %s", section->Name);
             continue;
+        }
 
         PVOID section_dest = (PVOID)((uintptr_t)dll_base + section->VirtualAddress);
         PVOID section_src = (PVOID)(dll_data.data() + section->PointerToRawData);
 
-        if (section->SizeOfRawData) {
-            if (!driver().write_memory_ex(section_dest, section_src, section->SizeOfRawData)) {
+        // Calculate section size
+        DWORD section_size = section->SizeOfRawData;
+        if (!section_size) {
+            if (section->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) {
+                section_size = headers.nt_headers->OptionalHeader.SizeOfInitializedData;
+            }
+            else if (section->Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA) {
+                section_size = headers.nt_headers->OptionalHeader.SizeOfUninitializedData;
+            }
+        }
+
+        if (section_size) {
+            log_debug("Writing section %s at 0x%p, size: 0x%X", section->Name, section_dest, section_size);
+            
+            // Write section data
+            if (!driver().write_memory_ex(section_dest, section_src, section_size)) {
                 log_error("Failed to write section: %s", section->Name);
                 driver().free_memory_ex(dll_base);
                 return false;
+            }
+            log_debug("Successfully wrote section: %s", section->Name);
+
+            // Set proper section protection
+            DWORD protect = 0;
+            if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+                protect = (section->Characteristics & IMAGE_SCN_MEM_WRITE) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+            }
+            else if (section->Characteristics & IMAGE_SCN_MEM_WRITE) {
+                protect = PAGE_READWRITE;
+            }
+            else if (section->Characteristics & IMAGE_SCN_MEM_READ) {
+                protect = PAGE_READONLY;
+            }
+            else {
+                protect = PAGE_NOACCESS;
+            }
+
+            DWORD old_protect;
+            if (driver().protect_memory_ex((uint64_t)section_dest, section_size, &old_protect) == STATUS_SUCCESS) {
+                log_debug("Set protection for section %s to 0x%X", section->Name, protect);
             }
         }
     }
@@ -1381,6 +1426,7 @@ bool manual_map_dll(const std::wstring& dll_path, DWORD pid) {
     // Resolve imports
     PIMAGE_DATA_DIRECTORY import_dir = &headers.nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (import_dir->Size) {
+        log_debug("Resolving imports...");
         PIMAGE_IMPORT_DESCRIPTOR import_desc = (PIMAGE_IMPORT_DESCRIPTOR)(dll_data.data() + import_dir->VirtualAddress);
         
         for (; import_desc->Name; import_desc++) {
@@ -1410,44 +1456,29 @@ bool manual_map_dll(const std::wstring& dll_path, DWORD pid) {
                 }
             }
         }
-    }
-
-    // Execute TLS callbacks
-    PIMAGE_DATA_DIRECTORY tls_dir = &headers.nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-    if (tls_dir->Size) {
-        PIMAGE_TLS_DIRECTORY tls = (PIMAGE_TLS_DIRECTORY)(dll_data.data() + tls_dir->VirtualAddress);
-        PIMAGE_TLS_CALLBACK* callback = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
-        if (callback) {
-            while (*callback) {
-                // Create thread to execute TLS callback
-                HANDLE h_thread = CreateRemoteThread(
-                    GetCurrentProcess(),
-                    NULL,
-                    0,
-                    (LPTHREAD_START_ROUTINE)*callback,
-                    NULL,
-                    0,
-                    NULL
-                );
-                if (h_thread) {
-                    WaitForSingleObject(h_thread, INFINITE);
-                    CloseHandle(h_thread);
-                }
-                callback++;
-            }
-        }
+        log_debug("Import resolution complete");
     }
 
     // Clear PE headers to hide from Process Hacker 2
     DWORD old_protect;
     if (driver().protect_memory_ex((uint64_t)dll_base, headers.nt_headers->OptionalHeader.SizeOfHeaders, &old_protect) == STATUS_SUCCESS) {
-        memset(dll_base, 0, headers.nt_headers->OptionalHeader.SizeOfHeaders);
+        BYTE* empty_buffer = new BYTE[headers.nt_headers->OptionalHeader.SizeOfHeaders];
+        memset(empty_buffer, 0, headers.nt_headers->OptionalHeader.SizeOfHeaders);
+        
+        if (driver().write_memory_ex(dll_base, empty_buffer, headers.nt_headers->OptionalHeader.SizeOfHeaders)) {
+            log_debug("Cleared PE headers successfully");
+        } else {
+            log_error("Failed to clear PE headers");
+        }
+        
+        delete[] empty_buffer;
         driver().protect_memory_ex((uint64_t)dll_base, headers.nt_headers->OptionalHeader.SizeOfHeaders, &old_protect);
     }
 
     // Execute DLL entry point
     DWORD entry_point = headers.nt_headers->OptionalHeader.AddressOfEntryPoint;
     if (entry_point) {
+        log_debug("Creating thread for DLL entry point at 0x%p", (PVOID)((uintptr_t)dll_base + entry_point));
         HANDLE h_thread = CreateRemoteThread(
             GetCurrentProcess(),
             NULL,
@@ -1460,6 +1491,9 @@ bool manual_map_dll(const std::wstring& dll_path, DWORD pid) {
         if (h_thread) {
             WaitForSingleObject(h_thread, INFINITE);
             CloseHandle(h_thread);
+            log_debug("DLL entry point executed successfully");
+        } else {
+            log_error("Failed to create thread for DLL entry point");
         }
     }
 
