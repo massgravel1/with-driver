@@ -211,7 +211,7 @@ public:
             return STATUS_UNSUCCESSFUL;
         }
 
-        log_debug("Module base: 0x%p, Size: 0x%X", (void*)mod->base_image, mod->size_of_image);
+        log_debug("Module base: 0x%llX, Size: 0x%llX", (unsigned long long)mod->base_image, (unsigned long long)mod->size_of_image);
         return STATUS_SUCCESS;
     }
 
@@ -323,13 +323,13 @@ inline c_driver& driver()
 
 // Function to extract driver binary to a file
 bool extract_driver(const std::wstring& driver_path) {
-    std::ofstream file(driver_path, std::ios::binary);
+    std::wofstream file(driver_path, std::ios::binary);
     if (!file.is_open()) {
         std::wcerr << L"Failed to create driver file: " << driver_path << std::endl;
         return false;
     }
     
-    file.write(reinterpret_cast<const char*>(g_driver_binary), g_driver_binary_size);
+    file.write(reinterpret_cast<const wchar_t*>(g_driver_binary), g_driver_binary_size);
     file.close();
     
     if (file.fail()) {
@@ -676,7 +676,8 @@ int get_file_size(File *f)
         log_error("GetFileSizeEx failed (%ld)", GetLastError());
         return 0;
     }
-    f->size = lpFileSize.QuadPart;
+    size_t file_size = static_cast<size_t>(lpFileSize.QuadPart);
+    f->size = file_size;
     return 1;
 }
 
@@ -1141,11 +1142,11 @@ static inline std::wstring select_process_from_list()
 
         if (_Process32FirstW(hSnap, &procEntry))
         {
-            int index = 0;
+            size_t index = 0;
             do
             {
                 processes.push_back({procEntry.th32ProcessID, std::wstring(procEntry.szExeFile)});
-                std::wcout << index << ": " << procEntry.szExeFile << " (PID: " << procEntry.th32ProcessID << ")" << std::endl;
+                std::wcout << index << L": " << procEntry.szExeFile << L" (PID: " << procEntry.th32ProcessID << L")" << std::endl;
                 index++;
             } while (_Process32NextW(hSnap, &procEntry));
         }
@@ -1153,12 +1154,12 @@ static inline std::wstring select_process_from_list()
     _CloseHandle(hSnap);
     
     int selection = -1;
-    std::cout << "Select a process by number: ";
-    std::cin >> selection;
+    std::wcout << L"Select a process by number: ";
+    std::wcin >> selection;
     
-    if(selection >= 0 && selection < processes.size())
+    if(selection >= 0 && static_cast<size_t>(selection) < processes.size())
     {
-        std::cout << "Selected: " << processes[selection].second.c_str() << " (PID: " << processes[selection].first << ")" << std::endl;
+        std::wcout << L"Selected: " << processes[selection].second.c_str() << L" (PID: " << processes[selection].first << L")" << std::endl;
         return processes[selection].second;
     }
     
@@ -1168,9 +1169,9 @@ static inline std::wstring select_process_from_list()
 // Get DLL path from user
 static inline std::wstring get_dll_path_from_user()
 {
+    std::wcout << L"Enter DLL path: ";
     std::wstring path;
-    std::wcout << "Enter DLL path: ";
-    std::wcin >> path;
+    std::getline(std::wcin, path);
     return path;
 }
 
