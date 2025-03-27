@@ -87,4 +87,3 @@ For advanced users who wish to modify the driver or customize the injection proc
 ## Credits
 
 - Original injector code from SSS-AND-LOFE-CLOUD project
-- Driver implementation based on Face-Injector-V3 
