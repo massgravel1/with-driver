@@ -1296,6 +1296,177 @@ bool manual_map_dll_with_driver(DWORD process_id, BYTE* pSrcData, bool ClearHead
     return true;
 }
 
+// PE Structures
+typedef struct _PE_HEADERS {
+    PIMAGE_DOS_HEADER dos_header;
+    PIMAGE_NT_HEADERS nt_headers;
+    PIMAGE_SECTION_HEADER section_header;
+    DWORD section_count;
+} PE_HEADERS, *PPE_HEADERS;
+
+// Manual Mapping Functions
+bool parse_pe_headers(const std::vector<uint8_t>& dll_data, PPE_HEADERS headers) {
+    headers->dos_header = (PIMAGE_DOS_HEADER)dll_data.data();
+    if (headers->dos_header->e_magic != IMAGE_DOS_SIGNATURE) {
+        log_error("Invalid DOS signature");
+        return false;
+    }
+
+    headers->nt_headers = (PIMAGE_NT_HEADERS)(dll_data.data() + headers->dos_header->e_lfanew);
+    if (headers->nt_headers->Signature != IMAGE_NT_SIGNATURE) {
+        log_error("Invalid NT signature");
+        return false;
+    }
+
+    headers->section_header = IMAGE_FIRST_SECTION(headers->nt_headers);
+    headers->section_count = headers->nt_headers->FileHeader.NumberOfSections;
+    return true;
+}
+
+bool manual_map_dll(const std::wstring& dll_path, DWORD pid) {
+    log_info("Starting manual mapping process for: %ws", dll_path.c_str());
+
+    // Read DLL file
+    std::ifstream file(dll_path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        log_error("Failed to open DLL file");
+        return false;
+    }
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> dll_data(size);
+    if (!file.read(reinterpret_cast<char*>(dll_data.data()), size)) {
+        log_error("Failed to read DLL file");
+        return false;
+    }
+
+    // Parse PE headers
+    PE_HEADERS headers = { 0 };
+    if (!parse_pe_headers(dll_data, &headers)) {
+        log_error("Failed to parse PE headers");
+        return false;
+    }
+
+    // Allocate memory for DLL
+    PVOID dll_base = driver().alloc_memory_ex(
+        headers.nt_headers->OptionalHeader.SizeOfImage,
+        PAGE_EXECUTE_READWRITE
+    );
+    if (!dll_base) {
+        log_error("Failed to allocate memory for DLL");
+        return false;
+    }
+
+    log_debug("Allocated memory at: 0x%p", dll_base);
+
+    // Map sections
+    for (DWORD i = 0; i < headers.section_count; i++) {
+        PIMAGE_SECTION_HEADER section = &headers.section_header[i];
+        if (section->Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
+            continue;
+
+        PVOID section_dest = (PVOID)((uintptr_t)dll_base + section->VirtualAddress);
+        PVOID section_src = (PVOID)(dll_data.data() + section->PointerToRawData);
+
+        if (section->SizeOfRawData) {
+            if (!driver().write_memory_ex(section_dest, section_src, section->SizeOfRawData)) {
+                log_error("Failed to write section: %s", section->Name);
+                driver().free_memory_ex(dll_base);
+                return false;
+            }
+        }
+    }
+
+    // Resolve imports
+    PIMAGE_DATA_DIRECTORY import_dir = &headers.nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (import_dir->Size) {
+        PIMAGE_IMPORT_DESCRIPTOR import_desc = (PIMAGE_IMPORT_DESCRIPTOR)(dll_data.data() + import_dir->VirtualAddress);
+        
+        for (; import_desc->Name; import_desc++) {
+            char* module_name = (char*)(dll_data.data() + import_desc->Name);
+            HMODULE h_module = LoadLibraryA(module_name);
+            if (!h_module) {
+                log_error("Failed to load module: %s", module_name);
+                continue;
+            }
+
+            PIMAGE_THUNK_DATA original_first_thunk = (PIMAGE_THUNK_DATA)(dll_data.data() + import_desc->OriginalFirstThunk);
+            PIMAGE_THUNK_DATA first_thunk = (PIMAGE_THUNK_DATA)(dll_data.data() + import_desc->FirstThunk);
+
+            for (; original_first_thunk->u1.AddressOfData; original_first_thunk++, first_thunk++) {
+                PIMAGE_IMPORT_BY_NAME import_by_name = (PIMAGE_IMPORT_BY_NAME)(dll_data.data() + 
+                    original_first_thunk->u1.AddressOfData);
+                
+                FARPROC function = GetProcAddress(h_module, (char*)import_by_name->Name);
+                if (!function) {
+                    log_error("Failed to get function address: %s", import_by_name->Name);
+                    continue;
+                }
+
+                // Write function address
+                if (!driver().write_memory_ex(&first_thunk->u1.Function, &function, sizeof(function))) {
+                    log_error("Failed to write function address");
+                }
+            }
+        }
+    }
+
+    // Execute TLS callbacks
+    PIMAGE_DATA_DIRECTORY tls_dir = &headers.nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tls_dir->Size) {
+        PIMAGE_TLS_DIRECTORY tls = (PIMAGE_TLS_DIRECTORY)(dll_data.data() + tls_dir->VirtualAddress);
+        PIMAGE_TLS_CALLBACK* callback = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
+        if (callback) {
+            while (*callback) {
+                // Create thread to execute TLS callback
+                HANDLE h_thread = CreateRemoteThread(
+                    GetCurrentProcess(),
+                    NULL,
+                    0,
+                    (LPTHREAD_START_ROUTINE)*callback,
+                    NULL,
+                    0,
+                    NULL
+                );
+                if (h_thread) {
+                    WaitForSingleObject(h_thread, INFINITE);
+                    CloseHandle(h_thread);
+                }
+                callback++;
+            }
+        }
+    }
+
+    // Clear PE headers to hide from Process Hacker 2
+    DWORD old_protect;
+    if (driver().protect_memory_ex((uint64_t)dll_base, headers.nt_headers->OptionalHeader.SizeOfHeaders, &old_protect) == STATUS_SUCCESS) {
+        memset(dll_base, 0, headers.nt_headers->OptionalHeader.SizeOfHeaders);
+        driver().protect_memory_ex((uint64_t)dll_base, headers.nt_headers->OptionalHeader.SizeOfHeaders, &old_protect);
+    }
+
+    // Execute DLL entry point
+    DWORD entry_point = headers.nt_headers->OptionalHeader.AddressOfEntryPoint;
+    if (entry_point) {
+        HANDLE h_thread = CreateRemoteThread(
+            GetCurrentProcess(),
+            NULL,
+            0,
+            (LPTHREAD_START_ROUTINE)((uintptr_t)dll_base + entry_point),
+            NULL,
+            0,
+            NULL
+        );
+        if (h_thread) {
+            WaitForSingleObject(h_thread, INFINITE);
+            CloseHandle(h_thread);
+        }
+    }
+
+    log_info("Manual mapping completed successfully");
+    return true;
+}
+
 int main(int argc, char* argv[])
 {
     log_info("Starting DLL injection process");
@@ -1331,76 +1502,11 @@ int main(int argc, char* argv[])
     log_info("Attaching to process...");
     driver().attach_process(pid);
 
-    // Get process handle
-    log_debug("Opening process handle...");
-    HANDLE h_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!h_process) {
-        log_error("Failed to open process. Error: 0x%X", GetLastError());
+    // Perform manual mapping
+    if (!manual_map_dll(dll_path, pid)) {
+        log_error("Manual mapping failed");
         return 1;
     }
-    log_debug("Process handle opened successfully");
-
-    // Allocate memory for DLL path
-    log_debug("Allocating memory for DLL path...");
-    PVOID dll_path_addr = driver().alloc_memory_ex((dll_path.length() + 1) * sizeof(wchar_t), PAGE_READWRITE);
-    if (!dll_path_addr) {
-        log_error("Failed to allocate memory for DLL path");
-        CloseHandle(h_process);
-        return 1;
-    }
-    log_debug("Memory allocated at: 0x%p", dll_path_addr);
-
-    // Write DLL path to process memory
-    log_debug("Writing DLL path to process memory...");
-    if (driver().write_memory_ex(dll_path_addr, (PVOID)dll_path.c_str(), (dll_path.length() + 1) * sizeof(wchar_t)) != STATUS_SUCCESS) {
-        log_error("Failed to write DLL path to process memory");
-        driver().free_memory_ex(dll_path_addr);
-        CloseHandle(h_process);
-        return 1;
-    }
-    log_debug("DLL path written successfully");
-
-    // Get LoadLibraryW address
-    log_debug("Getting LoadLibraryW address...");
-    HMODULE h_kernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (!h_kernel32) {
-        log_error("Failed to get kernel32.dll handle. Error: 0x%X", GetLastError());
-        driver().free_memory_ex(dll_path_addr);
-        CloseHandle(h_process);
-        return 1;
-    }
-
-    PVOID load_library_addr = (PVOID)GetProcAddress(h_kernel32, "LoadLibraryW");
-    if (!load_library_addr) {
-        log_error("Failed to get LoadLibraryW address. Error: 0x%X", GetLastError());
-        driver().free_memory_ex(dll_path_addr);
-        CloseHandle(h_process);
-        return 1;
-    }
-    log_debug("LoadLibraryW address: 0x%p", load_library_addr);
-
-    // Create remote thread to load DLL
-    log_info("Creating remote thread to load DLL...");
-    HANDLE h_thread = CreateRemoteThread(h_process, NULL, 0, (LPTHREAD_START_ROUTINE)load_library_addr, dll_path_addr, 0, NULL);
-    if (!h_thread) {
-        log_error("Failed to create remote thread. Error: 0x%X", GetLastError());
-        driver().free_memory_ex(dll_path_addr);
-        CloseHandle(h_process);
-        return 1;
-    }
-    log_debug("Remote thread created successfully");
-
-    // Wait for thread to complete
-    log_debug("Waiting for thread completion...");
-    WaitForSingleObject(h_thread, INFINITE);
-    log_debug("Thread completed successfully");
-
-    // Cleanup
-    log_info("Cleaning up resources...");
-    CloseHandle(h_thread);
-    driver().free_memory_ex(dll_path_addr);
-    CloseHandle(h_process);
-    log_info("Cleanup completed");
 
     log_info("DLL injection completed successfully");
     return 0;
